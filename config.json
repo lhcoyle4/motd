@@ -1,0 +1,12 @@
+{
+    "username": "Louie",
+    "weather_location": "Portland,ME",
+    "theme": "ocean",
+    "sections": {
+        "system_stats": true,
+        "weather": true,
+        "git_status": true,
+        "todos": true,
+        "dev_tips": true
+    }
+}
