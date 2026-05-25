@@ -13,7 +13,7 @@ import re
 import subprocess
 import argparse
 import socket
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from html import unescape
 
@@ -176,18 +176,99 @@ def save_json_file(file_path, data):
 
 # --- Weather & Git Status Fetchers ---
 
+WEATHER_EMOJIS = {
+    "113": "☀️", "116": "⛅", "119": "☁️", "122": "☁️",
+    "143": "🌫️", "248": "🌫️", "260": "🌫️", "176": "🌦️",
+    "263": "🌧️", "266": "🌧️", "281": "🌧️", "284": "🌧️",
+    "293": "🌧️", "296": "🌧️", "299": "🌧️", "302": "🌧️",
+    "305": "🌧️", "308": "🌧️", "311": "🌧️", "314": "🌧️",
+    "353": "🌦️", "356": "🌧️", "359": "🌧️", "179": "🌨️",
+    "182": "🌨️", "185": "🌨️", "227": "🌨️", "230": "❄️",
+    "317": "🌨️", "320": "🌨️", "323": "🌨️", "326": "🌨️",
+    "329": "🌨️", "332": "🌨️", "335": "🌨️", "338": "❄️",
+    "350": "🌨️", "362": "🌨️", "365": "🌨️", "368": "🌨️",
+    "371": "🌨️", "374": "🌨️", "377": "🌨️", "200": "⛈️",
+    "386": "⛈️", "389": "⛈️", "392": "⛈️", "395": "⛈️",
+}
+
 def fetch_weather(location):
     if not requests:
         return "Weather requires 'requests' module."
     try:
-        # Fetch simple format: emoji/condition, temperature, description
-        url = f"https://wttr.in/{location}?format=%c+%t+%C"
-        response = requests.get(url, timeout=2.0)
-        if response.status_code == 200:
-            return response.text.strip()
+        # 1. Fetch today's weather
+        url_today = f"https://wttr.in/{location}?format=%c+%t+%C"
+        response_today = requests.get(url_today, timeout=3.0)
+        if response_today.status_code != 200:
+            return "Weather unavailable"
+        
+        today_str = response_today.text.strip()
+        
+        # Parse today's parts
+        parts = today_str.split(None, 2)
+        if len(parts) >= 2:
+            today_emoji = parts[0]
+            today_temp = parts[1]
+            today_desc = parts[2] if len(parts) > 2 else ""
+        else:
+            today_emoji = ""
+            today_temp = today_str
+            today_desc = ""
+
+        use_celsius = "°C" in today_str
+        
+        # 2. Fetch tomorrow's forecast
+        url_json = f"https://wttr.in/{location}?format=j1"
+        response_json = requests.get(url_json, timeout=3.0)
+        if response_json.status_code == 200:
+            r_json = response_json.json()
+            tomorrow = r_json['weather'][1]
+            
+            if use_celsius:
+                mintemp = tomorrow['mintempC']
+                maxtemp = tomorrow['maxtempC']
+                unit = "°C"
+            else:
+                mintemp = tomorrow['mintempF']
+                maxtemp = tomorrow['maxtempF']
+                unit = "°F"
+                
+            hourly = tomorrow.get('hourly', [])
+            desc = ""
+            code = ""
+            if hourly:
+                mid_idx = 4 if len(hourly) > 4 else len(hourly) // 2
+                noon_data = hourly[mid_idx]
+                desc = noon_data.get('weatherDesc', [{}])[0].get('value', '').strip()
+                code = noon_data.get('weatherCode', '')
+                
+            emoji = WEATHER_EMOJIS.get(code, "☁️")
+            
+            # Format options
+            # Format 1: Full detail
+            today_full = f"Today: {today_emoji} {today_temp} {today_desc}".strip()
+            tomorrow_full = f"Tomorrow: {emoji} {mintemp}..{maxtemp}{unit} {desc}".strip()
+            combined = f"{today_full}  ·  {tomorrow_full}"
+            
+            # Check limit (51 chars visual length)
+            if clean_len(combined) > 51:
+                # Format 2: Drop tomorrow's description
+                tomorrow_short = f"Tomorrow: {emoji} {mintemp}..{maxtemp}{unit}".strip()
+                combined = f"{today_full}  ·  {tomorrow_short}"
+                
+            if clean_len(combined) > 51:
+                # Format 3: Drop both descriptions
+                today_short = f"Today: {today_emoji} {today_temp}".strip()
+                combined = f"{today_short}  ·  {tomorrow_short}"
+                
+            if clean_len(combined) > 51:
+                # Format 4: Ultra short (no prefixes)
+                combined = f"{today_emoji} {today_temp}  ·  {emoji} {mintemp}..{maxtemp}{unit}"
+                
+            return combined
+        else:
+            return today_str
     except Exception as e:
         return f"Offline/Error: {str(e)}"
-    return "Weather unavailable"
 
 def check_git_repo(path):
     try:
@@ -1029,6 +1110,23 @@ INNER_WIDTH = BOX_WIDTH - 2  # 62
 
 import unicodedata
 
+def to_superscript(text):
+    mapping = {
+        '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+        '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+        '-': '⁻', ':': ':', ' ': ' ', 'U': 'ᵁ', 'T': 'ᵀ', 'C': 'ᶜ',
+        'A': 'ᴬ', 'B': 'ᴮ', 'D': 'ᴰ', 'E': 'ᴱ', 'F': 'ᶠ', 'G': 'ᴳ',
+        'H': 'ᴴ', 'I': 'ᴵ', 'J': 'ᴶ', 'K': 'ᴷ', 'L': 'ᴸ', 'M': 'ᴹ',
+        'N': 'ᴺ', 'O': 'ᴼ', 'P': 'ᴾ', 'Q': 'ᵠ', 'R': 'ᴿ', 'S': 'ˢ',
+        'V': 'ⱽ', 'W': 'ᵂ', 'X': 'ˣ', 'Y': 'ʸ', 'Z': 'ᶻ',
+        'a': 'ᵃ', 'b': 'ᵇ', 'c': 'ᶜ', 'd': 'ᵈ', 'e': 'ᵉ', 'f': 'ᶠ',
+        'g': 'ᵍ', 'h': 'ʰ', 'i': 'ⁱ', 'j': 'ʲ', 'k': 'ᵏ', 'l': 'ˡ',
+        'm': 'ᵐ', 'n': 'ⁿ', 'o': 'ᵒ', 'p': 'ᵖ', 'q': 'ᵠ', 'r': 'ʳ',
+        's': 'ˢ', 't': 'ᵗ', 'u': 'ᵘ', 'v': 'ᵛ', 'w': 'ʷ', 'x': 'ˣ',
+        'y': 'ʸ', 'z': 'ᶻ'
+    }
+    return "".join(mapping.get(c, c) for c in text)
+
 def clean_len(s):
     # Strip OSC 8 hyperlink wrappers and CSI color codes so width math counts
     # only the visible characters.
@@ -1143,6 +1241,13 @@ def print_dashboard():
     left_welcome = f"  {colors['highlight']}{user_str}"
     right_welcome = f"{colors['sub']}{now_str}  "
     print(format_row(left_welcome, right_welcome, colors))
+    
+    # UTC timestamp in superscript/small font on a separate line in magenta color
+    utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    utc_small = to_superscript(utc_str)
+    right_utc = f"{Fore.MAGENTA}{utc_small}  "
+    print(format_row("", right_utc, colors))
+    
     print(make_border_bottom(colors))
     
     # Load Cache
