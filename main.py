@@ -9,10 +9,13 @@ if sys.platform.startswith("win"):
         pass
 import json
 import time
+import re
 import subprocess
 import argparse
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta
+from html.parser import HTMLParser
+from html import unescape
 
 # Optional dependencies
 try:
@@ -28,13 +31,46 @@ except ImportError:
 try:
     import colorama
     from colorama import Fore, Back, Style
-    colorama.init()
+    try:
+        # colorama >= 0.4.6: enables native VT/ANSI via SetConsoleMode without
+        # wrapping stdout, so colors work in both old PowerShell and pwsh7/Windows Terminal.
+        colorama.just_fix_windows_console()
+    except AttributeError:
+        # Older colorama fallback
+        colorama.init(strip=False)
 except ImportError:
-    # Fallback if colorama is not installed
-    class EmptyColor:
+    # Fallback if colorama is not installed. Output raw ANSI codes anyway,
+    # as modern Windows terminals support them.
+    class ANSIColor:
+        def __init__(self, offset):
+            self.offset = offset
+        def __getattr__(self, name):
+            if name == "RESET_ALL":
+                return "\033[0m"
+            colors = {
+                "BLACK": 0, "RED": 1, "GREEN": 2, "YELLOW": 3,
+                "BLUE": 4, "MAGENTA": 5, "CYAN": 6, "WHITE": 7,
+                "LIGHTBLACK_EX": 60, "LIGHTRED_EX": 61, "LIGHTGREEN_EX": 62,
+                "LIGHTYELLOW_EX": 63, "LIGHTBLUE_EX": 64, "LIGHTMAGENTA_EX": 65,
+                "LIGHTCYAN_EX": 66, "LIGHTWHITE_EX": 67
+            }
+            if name in colors:
+                return f"\033[{self.offset + colors[name]}m"
+            return ""
+            
+    Fore = ANSIColor(30)
+    Back = ANSIColor(40)
+    class ANSIStyle:
+        RESET_ALL = "\033[0m"
         def __getattr__(self, name):
             return ""
-    Fore = Back = Style = EmptyColor()
+    Style = ANSIStyle()
+    
+    # Enable native VT processing on Windows without colorama
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
 # Constants
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,13 +83,18 @@ DEFAULT_CONFIG = {
     "username": "Louie",
     "weather_location": "Portland,ME",
     "theme": "ocean",
+    "hyperlinks": True,
     "sections": {
         "system_stats": True,
         "weather": True,
         "git_status": True,
         "todos": True,
         "dev_tips": True,
-        "network": True
+        "network": True,
+        "current_events": True,
+        "on_this_day": True,
+        "births_deaths": True,
+        "random_fact": True
     }
 }
 
@@ -203,12 +244,33 @@ def check_git_repo(path):
             else:
                 remote = "Synced"
 
+        # Get last commit timestamp or mtime fallback
+        mtime = 0
+        try:
+            commit_time_run = subprocess.run(
+                ["git", "log", "-1", "--format=%ct"],
+                cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True
+            )
+            if commit_time_run.returncode == 0:
+                mtime = int(commit_time_run.stdout.strip())
+        except Exception:
+            pass
+        if not mtime:
+            try:
+                mtime = int(os.path.getmtime(os.path.join(path, ".git")))
+            except Exception:
+                try:
+                    mtime = int(os.path.getmtime(path))
+                except Exception:
+                    mtime = 0
+
         return {
             "branch": branch,
             "dirty": len(lines) > 0,
             "modified": modified,
             "untracked": untracked,
-            "remote": remote
+            "remote": remote,
+            "mtime": mtime
         }
     except Exception:
         return None
@@ -226,6 +288,259 @@ def fetch_all_git_status():
             if status:
                 status_map[name] = status
     return status_map
+
+# --- Wikipedia Knowledge Fetchers ---
+
+WIKI_UA = "motd-dashboard/1.0 (personal terminal dashboard)"
+WIKI_REST = "https://en.wikipedia.org/api/rest_v1"
+
+# Namespaces that are not real article pages (skip when picking event links)
+_NON_ARTICLE_NS = (
+    "File:", "Help:", "Template:", "Portal:", "Wikipedia:",
+    "Category:", "Special:", "Talk:", "Module:"
+)
+
+# Current-events category importance weights (higher = more important)
+CE_CATEGORY_WEIGHT = {
+    "Armed conflicts and attacks": 5,
+    "Disasters and accidents": 5,
+    "International relations": 4,
+    "Politics and elections": 4,
+    "Law and crime": 3,
+    "Business and economy": 3,
+    "Health and environment": 3,
+    "Health and medicine": 3,
+    "Science and technology": 2,
+    "Arts and culture": 1,
+    "Sport": 1,
+    "Sports": 1,
+}
+CE_CATEGORIES = set(CE_CATEGORY_WEIGHT.keys())
+
+
+def _wiki_page_link(page):
+    """Pull a normalized title + desktop URL from an onthisday 'pages' entry."""
+    if not page:
+        return "", ""
+    title = page.get("normalizedtitle") or page.get("titles", {}).get("normalized", "")
+    url = page.get("content_urls", {}).get("desktop", {}).get("page", "")
+    return title, url
+
+
+def fetch_on_this_day():
+    """Selected historical events, notable births, and deaths for today's date."""
+    result = {"events": [], "births": [], "deaths": []}
+    if not requests:
+        return result
+    now = datetime.now()
+    mm, dd = f"{now.month:02d}", f"{now.day:02d}"
+    headers = {"User-Agent": WIKI_UA}
+    # 'selected' = curated/notable events; births/deaths for people
+    for out_key, api_type in (("events", "selected"), ("births", "births"), ("deaths", "deaths")):
+        try:
+            url = f"{WIKI_REST}/feed/onthisday/{api_type}/{mm}/{dd}"
+            r = requests.get(url, headers=headers, timeout=4.0)
+            if r.status_code != 200:
+                continue
+            items = r.json().get(api_type, [])
+            parsed = []
+            for it in items:
+                text = (it.get("text") or "").strip()
+                if not text:
+                    continue
+                title, link = _wiki_page_link((it.get("pages") or [None])[0])
+                parsed.append({
+                    "text": text,
+                    "year": it.get("year"),
+                    "title": title,
+                    "url": link,
+                })
+            # Most recent first; cap the stored pool
+            parsed.sort(key=lambda x: (x["year"] is None, -(x["year"] or 0)))
+            result[out_key] = parsed[:15]
+        except Exception:
+            pass
+    return result
+
+
+# Offline "Did you know?" facts, used when Wikipedia is unreachable. Each still
+# links to the relevant Wikipedia article so it stays clickable.
+OFFLINE_FACTS = [
+    {"title": "Octopus", "text": "An octopus has three hearts and blue, copper-based blood; two hearts pump blood to the gills and the third to the rest of the body.", "url": "https://en.wikipedia.org/wiki/Octopus"},
+    {"title": "Honey", "text": "Honey never spoils -- edible honey has been found in ancient Egyptian tombs after more than 3,000 years.", "url": "https://en.wikipedia.org/wiki/Honey"},
+    {"title": "Banana", "text": "Bananas are botanically berries, while strawberries are not.", "url": "https://en.wikipedia.org/wiki/Banana"},
+    {"title": "Venus", "text": "A day on Venus is longer than its year -- it rotates more slowly than it orbits the Sun.", "url": "https://en.wikipedia.org/wiki/Venus"},
+    {"title": "Wombat", "text": "Wombats produce cube-shaped droppings, which keep the dung from rolling away and help mark territory.", "url": "https://en.wikipedia.org/wiki/Wombat"},
+    {"title": "Eiffel Tower", "text": "The Eiffel Tower can grow more than 15 cm taller in summer, as heat causes the iron to expand.", "url": "https://en.wikipedia.org/wiki/Eiffel_Tower"},
+    {"title": "Sea otter", "text": "Sea otters hold hands while sleeping so they don't drift apart on the water.", "url": "https://en.wikipedia.org/wiki/Sea_otter"},
+    {"title": "Lightning", "text": "A bolt of lightning is roughly five times hotter than the surface of the Sun.", "url": "https://en.wikipedia.org/wiki/Lightning"},
+    {"title": "Sloth", "text": "Sloths can hold their breath longer than dolphins by slowing their heart rate to a fraction of normal.", "url": "https://en.wikipedia.org/wiki/Sloth"},
+    {"title": "Saturn", "text": "Saturn is the least dense planet in the Solar System -- it would float in water if a large enough ocean existed.", "url": "https://en.wikipedia.org/wiki/Saturn"},
+    {"title": "Tardigrade", "text": "Tardigrades can survive the vacuum of space, extreme radiation, and temperatures near absolute zero.", "url": "https://en.wikipedia.org/wiki/Tardigrade"},
+    {"title": "Great Wall of China", "text": "Contrary to popular belief, the Great Wall of China is not visible to the naked eye from space.", "url": "https://en.wikipedia.org/wiki/Great_Wall_of_China"},
+]
+
+
+def fetch_random_fact():
+    """A random Wikipedia article summary, used as a 'Did you know' style fact.
+    Falls back to a bundled offline fact when Wikipedia is unreachable."""
+    import random
+    if requests:
+        headers = {"User-Agent": WIKI_UA}
+        for _ in range(4):
+            try:
+                r = requests.get(f"{WIKI_REST}/page/random/summary", headers=headers, timeout=4.0)
+                if r.status_code != 200:
+                    break
+                d = r.json()
+                if d.get("type") == "disambiguation":
+                    continue
+                title = (d.get("title") or "").strip()
+                extract = (d.get("extract") or "").strip()
+                url = d.get("content_urls", {}).get("desktop", {}).get("page", "")
+                # Skip stubs and list/index pages -- they make poor "facts"
+                if len(extract) < 50 or title.lower().startswith(("list of", "index of")):
+                    continue
+                return {"text": extract, "title": title, "url": url}
+            except Exception:
+                break
+    # Offline / failure fallback
+    return random.choice(OFFLINE_FACTS)
+
+
+class _CurrentEventsParser(HTMLParser):
+    """Extracts leaf events from a Portal:Current_events day page: each event's
+    text, primary article link, category, and the id of its category heading
+    (used to deep-link back to that section of the day page so the reader can
+    pick among the event's multiple news-source citations)."""
+
+    # Block tags whose id should be remembered as a potential heading anchor.
+    _HEADING_TAGS = {"div", "p", "h2", "h3", "h4", "h5", "section"}
+
+    def __init__(self):
+        super().__init__()
+        self.li_stack = []        # one dict per open <li>
+        self.events = []          # finished leaf events
+        self.cur_category = ""
+        self.cur_heading_id = ""  # id of the heading for cur_category
+        self._last_block_id = ""  # id of the most recent block element
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in self._HEADING_TAGS:
+            self._last_block_id = attrs.get("id", "")
+        if tag == "ul" and self.li_stack:
+            # The <li> that contains this <ul> is a grouping/topic line, not a leaf
+            self.li_stack[-1]["has_child_ul"] = True
+        elif tag == "li":
+            self.li_stack.append({"text": [], "url": "", "has_child_ul": False})
+        elif tag == "a" and self.li_stack:
+            href = attrs.get("href", "")
+            li = self.li_stack[-1]
+            if (href.startswith("/wiki/") and not li["url"]
+                    and not any(href.startswith("/wiki/" + ns) for ns in _NON_ARTICLE_NS)):
+                li["url"] = "https://en.wikipedia.org" + href
+
+    def handle_endtag(self, tag):
+        if tag == "li" and self.li_stack:
+            li = self.li_stack.pop()
+            text = re.sub(r"\s+", " ", unescape("".join(li["text"]))).strip()
+            text = text.strip(" –-•")
+            if text and not li["has_child_ul"]:
+                self.events.append({
+                    "text": text,
+                    "article_url": li["url"],
+                    "category": self.cur_category,
+                    "anchor": self.cur_heading_id,
+                })
+
+    def handle_data(self, data):
+        if self.li_stack:
+            self.li_stack[-1]["text"].append(data)
+        else:
+            t = data.strip()
+            if t in CE_CATEGORIES:
+                self.cur_category = t
+                self.cur_heading_id = self._last_block_id
+
+
+def _parse_current_events_html(html_text):
+    if not html_text:
+        return []
+    try:
+        p = _CurrentEventsParser()
+        p.feed(html_text)
+        return p.events
+    except Exception:
+        return []
+
+
+def fetch_current_events(days_back=14, today_min=3, total=8):
+    """Read the last ~2 weeks of the Current Events portal, rank events by
+    importance (category + recency + link presence), and always surface at
+    least `today_min` of today's events."""
+    out = {"events": [], "today_count": 0}
+    if not requests:
+        return out
+    headers = {"User-Agent": WIKI_UA}
+    now = datetime.now()
+    all_events = []
+    today_events = []
+    for i in range(days_back):
+        d = now - timedelta(days=i)
+        day_slug = f"{d.year}_{d.strftime('%B')}_{d.day}"
+        # Click target: the specific day's Current Events page, where each event
+        # lists its news-source citations. Jump to the category section if the
+        # page exposes a heading anchor.
+        day_url = f"https://en.wikipedia.org/wiki/Portal:Current_events/{day_slug}"
+        page = f"Portal:Current events/{d.year} {d.strftime('%B')} {d.day}"
+        try:
+            r = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={"action": "parse", "page": page, "format": "json",
+                        "prop": "text", "formatversion": "2"},
+                headers=headers, timeout=4.0,
+            )
+            if r.status_code != 200:
+                continue
+            html_text = r.json().get("parse", {}).get("text", "")
+            if isinstance(html_text, dict):
+                html_text = html_text.get("*", "")
+            for e in _parse_current_events_html(html_text):
+                e["days_ago"] = i
+                e["date"] = d.strftime("%b %d")
+                anchor = e.get("anchor") or ""
+                e["url"] = day_url + (f"#{anchor}" if anchor else "")
+                all_events.append(e)
+                if i == 0:
+                    today_events.append(e)
+        except Exception:
+            pass
+
+    for e in all_events:
+        cw = CE_CATEGORY_WEIGHT.get(e["category"], 2)
+        e["score"] = cw * 10 + (2 if e.get("article_url") else 0) + min(len(e["text"]) // 50, 3) + max(0, 5 - e["days_ago"])
+
+    chosen, seen = [], set()
+
+    def add(ev):
+        key = ev["text"][:60].lower()
+        if key in seen:
+            return
+        seen.add(key)
+        chosen.append(ev)
+
+    for e in sorted(today_events, key=lambda x: -x["score"])[:today_min]:
+        add(e)
+    for e in sorted(all_events, key=lambda x: -x["score"]):
+        if len(chosen) >= total:
+            break
+        add(e)
+
+    out["events"] = chosen
+    out["today_count"] = sum(1 for e in chosen if e.get("days_ago") == 0)
+    return out
+
 
 def update_cache():
     config = load_config()
@@ -264,6 +579,17 @@ def update_cache():
     if len(down_history) > 18:
         down_history = down_history[-18:]
 
+    # Wikipedia knowledge feeds. On a failed/empty fetch, keep the last good
+    # cached values (offline fallback) so boxes don't blank out during outages.
+    on_this_day = fetch_on_this_day()
+    if not any(on_this_day.get(k) for k in ("events", "births", "deaths")):
+        on_this_day = existing_cache.get("on_this_day") or on_this_day
+    current_events = fetch_current_events()
+    if not current_events.get("events"):
+        current_events = existing_cache.get("current_events") or current_events
+    # Random fact always returns something (bundled offline facts as fallback)
+    random_fact = fetch_random_fact()
+
     cache_data = {
         "timestamp": time.time(),
         "weather": weather,
@@ -271,15 +597,56 @@ def update_cache():
         "conn_name": conn_name,
         "ip": ip,
         "up_history": up_history,
-        "down_history": down_history
+        "down_history": down_history,
+        "on_this_day": on_this_day,
+        "random_fact": random_fact,
+        "current_events": current_events,
+        "data_date": datetime.now().strftime("%Y-%m-%d"),
     }
     save_json_file(CACHE_FILE, cache_data)
     return cache_data
 
 # --- Todo List Operations ---
 
-def manage_todo(action, args):
+def load_todos():
     todos = load_json_file(TODO_FILE, [])
+    todo_dir = os.path.expanduser(os.path.join("~", "todo"))
+    if os.path.exists(todo_dir) and os.path.isdir(todo_dir):
+        try:
+            files = [f for f in os.listdir(todo_dir) if os.path.isfile(os.path.join(todo_dir, f))]
+            modified = False
+            for f in files:
+                name_without_ext, _ = os.path.splitext(f)
+                task_text = name_without_ext.replace("_", " ").replace("-", " ")
+                if task_text:
+                    task_text = task_text[0].upper() + task_text[1:]
+                
+                exists = any(t.get("text") == task_text or t.get("file") == f for t in todos)
+                if not exists:
+                    todos.append({
+                        "text": task_text,
+                        "done": False,
+                        "created_at": time.time(),
+                        "file": f
+                    })
+                    modified = True
+            
+            # If a file has been deleted from the todo folder, mark it as done if it isn't already
+            for t in todos:
+                if "file" in t and not t["done"]:
+                    file_path = os.path.join(todo_dir, t["file"])
+                    if not os.path.exists(file_path):
+                        t["done"] = True
+                        modified = True
+                        
+            if modified:
+                save_json_file(TODO_FILE, todos)
+        except Exception:
+            pass
+    return todos
+
+def manage_todo(action, args):
+    todos = load_todos()
     
     if action == "add":
         task_text = " ".join(args)
@@ -592,6 +959,42 @@ import re
 import textwrap
 
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+# OSC 8 hyperlink sequences: ESC ] 8 ; params ; URI  (terminated by BEL or ESC \)
+OSC8_ESCAPE = re.compile(r'\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+def hyperlink(text, url, enabled=True):
+    """Wrap visible text in an OSC 8 terminal hyperlink (clickable in modern
+    terminals like Windows Terminal). Falls back to plain text when disabled
+    or when no URL is available."""
+    if not enabled or not url:
+        return text
+    return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
+
+
+def print_entry(bullet, text, url, colors, links_on, text_color=None,
+                indent="  ", wrap=True):
+    """Render a single (optionally clickable, optionally wrapped) list entry
+    inside a box. The whole text becomes the clickable link target."""
+    text_color = text_color if text_color is not None else colors["val"]
+    bullet_vis = clean_len(bullet)
+    # width available for the text after indent + bullet + trailing pad
+    avail = INNER_WIDTH - clean_len(indent) - bullet_vis - 2
+    if avail < 10:
+        avail = 10
+    if wrap:
+        lines = textwrap.wrap(text, width=avail) or [""]
+    else:
+        lines = [truncate_str(text, avail)]
+    cont_pad = " " * (clean_len(indent) + bullet_vis)
+    for i, ln in enumerate(lines):
+        shown = hyperlink(ln, url, links_on) if url else ln
+        if i == 0:
+            left = f"{indent}{bullet}{text_color}{shown}"
+        else:
+            left = f"{cont_pad}{text_color}{shown}"
+        print(format_row(left, "", colors))
+
 
 def get_todo_due(todo):
     due = todo.get("due")
@@ -624,8 +1027,22 @@ def get_todo_due(todo):
 BOX_WIDTH = 64
 INNER_WIDTH = BOX_WIDTH - 2  # 62
 
+import unicodedata
+
 def clean_len(s):
-    return len(ANSI_ESCAPE.sub('', s))
+    # Strip OSC 8 hyperlink wrappers and CSI color codes so width math counts
+    # only the visible characters.
+    plain = ANSI_ESCAPE.sub('', OSC8_ESCAPE.sub('', s))
+    w = 0
+    for char in plain:
+        # Check if the character is a Wide or Full-width character (like emojis)
+        if unicodedata.east_asian_width(char) in ('W', 'F'):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
 
 def pad_ansi(s, width, align="left"):
     vis_len = clean_len(s)
@@ -686,7 +1103,8 @@ def print_dashboard():
     config = load_config()
     colors = get_theme_colors(config.get("theme", "ocean"))
     sec = config.get("sections", {})
-    
+    links_on = config.get("hyperlinks", True)
+
     # 1. ASCII/Welcome Header
     print(make_border_top(None, colors))
     
@@ -750,9 +1168,11 @@ def print_dashboard():
     cache["down_history"] = down_history
     save_json_file(CACHE_FILE, cache)
     
-    # Check if cache is older than 15 mins or missing
+    # Refresh if cache is older than 15 mins, missing, or from a previous day
+    # (the knowledge feeds are date-specific and should roll over at midnight).
     cache_age = time.time() - cache.get("timestamp", 0)
-    if cache_age > 900 or not os.path.exists(CACHE_FILE):
+    stale_day = cache.get("data_date") != datetime.now().strftime("%Y-%m-%d")
+    if cache_age > 900 or stale_day or not os.path.exists(CACHE_FILE):
         # Spawn silent background updater
         try:
             subprocess.Popen(
@@ -857,50 +1277,152 @@ def print_dashboard():
                 
         print(make_border_bottom(colors))
 
+    import random
+
+    # 3b. Current Events (curated from Wikipedia's Current Events portal)
+    if sec.get("current_events", True):
+        ce = cache.get("current_events") or {}
+        ce_events = ce.get("events", []) or []
+        print(make_border_top("Current Events · Wikipedia", colors))
+        if ce_events:
+            for e in ce_events[:6]:
+                txt = e.get("text", "")
+                if e.get("days_ago", 0) != 0 and e.get("date"):
+                    txt = f"{txt} ({e['date']})"
+                print_entry(f"{colors['highlight']}• ", txt, e.get("url", ""),
+                            colors, links_on, wrap=False)
+        else:
+            msg = "Loading current events..." if not cache.get("data_date") else "No current events available."
+            print(format_row(f"  {colors['sub']}{msg}", "", colors))
+        print(make_border_bottom(colors))
+
+    # 3c. On This Day in History
+    if sec.get("on_this_day", True):
+        otd = cache.get("on_this_day") or {}
+        ev = otd.get("events", []) or []
+        print(make_border_top("On This Day in History", colors))
+        if ev:
+            sample = random.sample(ev, min(4, len(ev)))
+            sample.sort(key=lambda x: -(x.get("year") or 0))
+            for e in sample:
+                yr = e.get("year")
+                bullet = f"{colors['sub']}{(str(yr) + ' ') if yr else ''}{colors['label']}— "
+                print_entry(bullet, e.get("text", ""), e.get("url", ""),
+                            colors, links_on, wrap=False)
+        else:
+            msg = "Loading historical events..." if not cache.get("data_date") else "Unavailable."
+            print(format_row(f"  {colors['sub']}{msg}", "", colors))
+        print(make_border_bottom(colors))
+
+    # 3d. Notable Births & Deaths on this day
+    if sec.get("births_deaths", True):
+        otd = cache.get("on_this_day") or {}
+        births = otd.get("births", []) or []
+        deaths = otd.get("deaths", []) or []
+        print(make_border_top("Born & Died on This Day", colors))
+        if births or deaths:
+            for e in (random.sample(births, min(2, len(births))) if births else []):
+                yr = e.get("year")
+                bullet = f"{Fore.LIGHTGREEN_EX}★ {colors['sub']}{(str(yr) + '  ') if yr else ''}"
+                print_entry(bullet, e.get("text", ""), e.get("url", ""),
+                            colors, links_on, wrap=False)
+            for e in (random.sample(deaths, min(2, len(deaths))) if deaths else []):
+                yr = e.get("year")
+                bullet = f"{Fore.LIGHTBLACK_EX}† {colors['sub']}{(str(yr) + '  ') if yr else ''}"
+                print_entry(bullet, e.get("text", ""), e.get("url", ""),
+                            colors, links_on, wrap=False)
+        else:
+            msg = "Loading births & deaths..." if not cache.get("data_date") else "Unavailable."
+            print(format_row(f"  {colors['sub']}{msg}", "", colors))
+        print(make_border_bottom(colors))
+
+    # 3e. Did You Know? (random Wikipedia fact)
+    if sec.get("random_fact", True):
+        rf = cache.get("random_fact")
+        print(make_border_top("Did You Know?", colors))
+        if rf and rf.get("text"):
+            title = rf.get("title", "")
+            body = f"{title}: {rf['text']}" if title else rf["text"]
+            print_entry(f"{colors['highlight']}◆ ", body, rf.get("url", ""),
+                        colors, links_on, wrap=True)
+        else:
+            msg = "Loading a fact..." if not cache.get("data_date") else "Unavailable."
+            print(format_row(f"  {colors['sub']}{msg}", "", colors))
+        print(make_border_bottom(colors))
+
     # 4. Git Repository Alerts
     if sec.get("git_status"):
         git_data = cache.get("git_status", {})
         if git_data:
             print(make_border_top("Git Repository Tracker", colors))
-            clean_count = 0
-            shown_any = False
+            # Sort repos by mtime descending (most recently updated first)
+            sorted_repos = []
             for repo, rstatus in git_data.items():
                 if rstatus:
+                    mtime = rstatus.get("mtime", 0)
+                    sorted_repos.append((repo, rstatus, mtime))
+            sorted_repos.sort(key=lambda x: x[2], reverse=True)
+            
+            # Select at most 6 most recently updated ones with unique first 4 letters
+            selected_repos = []
+            seen_prefixes = set()
+            for repo, rstatus, mtime in sorted_repos:
+                prefix = repo[:4].lower()
+                if len(prefix) < 4:
+                    prefix = repo.lower()
+                if prefix not in seen_prefixes:
+                    seen_prefixes.add(prefix)
+                    selected_repos.append((repo, rstatus))
+                    if len(selected_repos) == 6:
+                        break
+                        
+            shown_repos = {repo for repo, _ in selected_repos}
+            
+            clean_count = 0
+            # Count clean repos from those not selected
+            for repo, rstatus in git_data.items():
+                if rstatus and repo not in shown_repos:
                     is_clean = not rstatus["dirty"] and rstatus["remote"] == "Synced"
                     if is_clean:
                         clean_count += 1
-                        continue
-                    
-                    shown_any = True
-                    branch = rstatus["branch"]
-                    remote = rstatus["remote"]
-                    
-                    # Highlight status
-                    if rstatus["dirty"]:
-                        # Dirty (modified / untracked)
-                        mod_count = rstatus.get('modified', 0)
-                        unt_count = rstatus.get('untracked', 0)
-                        status_str = f"{Fore.YELLOW}+{mod_count}m +{unt_count}u{colors['val']}"
-                    else:
-                        status_str = f"{Fore.GREEN}Clean{colors['val']}"
                         
-                    # Remote coloring
-                    if remote == "Synced":
-                        rem_str = f"{Fore.GREEN}Synced{colors['val']}"
-                    elif "Ahead" in remote:
-                        rem_str = f"{Fore.LIGHTGREEN_EX}{remote}{colors['val']}"
-                    elif "Behind" in remote:
-                        rem_str = f"{Fore.RED}{remote}{colors['val']}"
-                    else:
-                        rem_str = f"{Fore.LIGHTBLACK_EX}{remote}{colors['val']}"
-                        
-                    repo_name = truncate_str(repo, 15)
-                    branch_name = truncate_str(branch, 9)
+            shown_any = False
+            for repo, rstatus in selected_repos:
+                is_clean = not rstatus["dirty"] and rstatus["remote"] == "Synced"
+                if is_clean:
+                    clean_count += 1
+                    continue
                     
-                    left_part = f"  • {colors['highlight']}{repo_name:<15}  {colors['sub']}{branch_name:<9}"
-                    right_part = pad_ansi(status_str, 13, "left") + "  " + pad_ansi(rem_str, 10, "right")
+                shown_any = True
+                branch = rstatus["branch"]
+                remote = rstatus["remote"]
+                
+                # Highlight status
+                if rstatus["dirty"]:
+                    # Dirty (modified / untracked)
+                    mod_count = rstatus.get('modified', 0)
+                    unt_count = rstatus.get('untracked', 0)
+                    status_str = f"{Fore.YELLOW}+{mod_count}m +{unt_count}u{colors['val']}"
+                else:
+                    status_str = f"{Fore.GREEN}Clean{colors['val']}"
                     
-                    print(format_row(left_part, right_part, colors))
+                # Remote coloring
+                if remote == "Synced":
+                    rem_str = f"{Fore.GREEN}Synced{colors['val']}"
+                elif "Ahead" in remote:
+                    rem_str = f"{Fore.LIGHTGREEN_EX}{remote}{colors['val']}"
+                elif "Behind" in remote:
+                    rem_str = f"{Fore.RED}{remote}{colors['val']}"
+                else:
+                    rem_str = f"{Fore.LIGHTBLACK_EX}{remote}{colors['val']}"
+                    
+                repo_name = truncate_str(repo, 15)
+                branch_name = truncate_str(branch, 9)
+                
+                left_part = f"  • {colors['highlight']}{repo_name:<15}  {colors['sub']}{branch_name:<9}"
+                right_part = pad_ansi(status_str, 13, "left") + "  " + pad_ansi(rem_str, 10, "right")
+                
+                print(format_row(left_part, right_part, colors))
             
             if clean_count > 0:
                 footer_str = f"  {Fore.LIGHTBLACK_EX}... and {clean_count} other repositories are clean."
@@ -913,7 +1435,7 @@ def print_dashboard():
 
     # 5. Local Todos
     if sec.get("todos"):
-        todos = load_json_file(TODO_FILE, [])
+        todos = load_todos()
         pending = [t for t in todos if not t["done"]]
         
         if pending:
