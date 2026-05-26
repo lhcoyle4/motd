@@ -26,7 +26,63 @@ except ImportError:
 try:
     import requests
 except ImportError:
-    requests = None
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+    
+    class MockResponse:
+        def __init__(self, response, content):
+            self.status_code = response.getcode()
+            self.headers = response.info()
+            self.content = content
+            self._text = None
+
+        @property
+        def text(self):
+            if self._text is None:
+                charset = 'utf-8'
+                content_type = self.headers.get('Content-Type', '')
+                if 'charset=' in content_type:
+                    parts = content_type.split('charset=')
+                    if len(parts) > 1:
+                        charset = parts[1].split(';')[0].strip()
+                try:
+                    self._text = self.content.decode(charset, errors='replace')
+                except Exception:
+                    self._text = self.content.decode('utf-8', errors='replace')
+            return self._text
+
+        def json(self):
+            return json.loads(self.text)
+
+    class MockRequests:
+        def get(self, url, headers=None, params=None, timeout=None):
+            if params:
+                url = url + ('?' if '?' not in url else '&') + urllib.parse.urlencode(params)
+            
+            req = urllib.request.Request(url)
+            if headers:
+                for k, v in headers.items():
+                    req.add_header(k, v)
+            
+            kwargs = {}
+            if timeout is not None:
+                kwargs['timeout'] = timeout
+                
+            try:
+                with urllib.request.urlopen(req, **kwargs) as response:
+                    content = response.read()
+                    return MockResponse(response, content)
+            except urllib.error.HTTPError as e:
+                try:
+                    content = e.read()
+                except Exception:
+                    content = b""
+                return MockResponse(e, content)
+            except urllib.error.URLError as e:
+                raise Exception(f"Connection failed: {e.reason}")
+
+    requests = MockRequests()
 
 try:
     import colorama
